@@ -2937,6 +2937,46 @@ static void anthropic_prepare_live_continuation(request *r,
                                          &r->tool_orders, r->think_mode);
 }
 
+static bool chat_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Prepare the OpenAI chat/completions live-tool fast path.  The tool_call_id
+ * replayed in trailing role:"tool" messages is a precise continuation handle,
+ * even when a client re-serializes the assistant tool-call turn and exact
+ * token/text prefix matching no longer reaches the sampled frontier. */
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           chat_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->anthropic_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->anthropic_live_call_ids);
+    }
+    if (r->anthropic_live_call_ids.len == 0) return;
+    /* In batched mode, prefer the slot holding this tool frontier.  Unlike a
+     * tool-result-only Anthropic request, OpenAI also carries full history, so
+     * a vanished binding may still fall back to ordinary prefix matching. */
+    r->anthropic_requires_live_tool_state = true;
+
+    free(r->anthropic_live_suffix_text);
+    r->anthropic_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -3100,6 +3140,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    chat_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -4495,6 +4536,30 @@ static bool send_all(int fd, const void *p, size_t n) {
         deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return true;
+}
+
+/* A completed HTTP request leaves no expected inbound bytes on this socket.
+ * POLLIN therefore means either an orderly peer shutdown or unexpected
+ * pipelined data; MSG_PEEK distinguishes the two without consuming anything. */
+static bool client_socket_closed(int fd) {
+    if (fd < 0) return true;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char byte;
+    ssize_t got;
+    do {
+        got = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    } while (got < 0 && errno == EINTR);
+    if (got == 0) return true;
+    if (got > 0) return false;
+    return errno != EAGAIN && errno != EWOULDBLOCK;
 }
 
 static void json_escape(buf *b, const char *s) {
@@ -9536,7 +9601,8 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
                                               ds4_tokens *effective_prompt,
                                               int *matched_ids) {
     if (!s || !slot || !req || !effective_prompt) return 0;
-    if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if (req->api != API_ANTHROPIC && req->api != API_OPENAI) return 0;
+    if (!req->anthropic_live_suffix_text) return 0;
     if (req->anthropic_live_call_ids.len == 0) return 0;
     if (!anthropic_live_matches_request(s, slot,
                                         &req->anthropic_live_call_ids,
@@ -9964,8 +10030,20 @@ typedef struct {
     bool enable_cors;
     bool headers_sent;
     bool stream_failed;
+    bool client_disconnected;
     double last_keepalive;
 } server_prefill_progress;
+
+static bool server_request_cancelled(void *ud) {
+    server_prefill_progress *p = ud;
+    if (g_stop_requested) return true;
+    if (!p) return false;
+    if (p->stream_failed || p->client_disconnected) return true;
+    if (!client_socket_closed(p->fd)) return false;
+    p->client_disconnected = true;
+    if (p->stream) p->stream_failed = true;
+    return true;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -10421,6 +10499,8 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
 
+    if (server_request_cancelled(p)) return;
+
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
      * response headers the first time the callback fires and then emit a
@@ -10499,6 +10579,13 @@ static void send_prefill_failure_response(server *s, const job *j,
                                           const char *ctx, const char *flags,
                                           const char *err) {
     const char *kind = j->req.kind == REQ_CHAT ? "chat" : "completion";
+    if (progress && progress->client_disconnected) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s%s%s prefill interrupted: client disconnected",
+                   kind, ctx, flags && flags[0] ? " " : "",
+                   flags && flags[0] ? flags : "");
+        return;
+    }
     if (j->req.stream && progress && progress->headers_sent) {
         if (progress->stream_failed) {
             server_log(DS4_LOG_GENERATION,
@@ -10566,6 +10653,58 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+/* Coding agents may append per-turn metadata that is omitted when they rebuild
+ * history for the next request.  Keep a second, stripped visible key for the
+ * richer live KV frontier, just as we already do for hidden reasoning. */
+static const char * const transient_block_tags[] = {
+    "environment_details", /* Kilo Code / Roo Code workspace state */
+    "system-reminder",     /* OpenCode / Claude Code injected notes */
+};
+
+/* Return a copy with complete transient spans removed, or NULL when none were
+ * found.  Unterminated spans remain untouched so a malformed tag cannot make a
+ * false continuation key. */
+static char *strip_transient_blocks(const char *text) {
+    if (!text) return NULL;
+    buf out = {0};
+    bool stripped = false;
+    const char *p = text;
+    while (*p) {
+        const char *open = strchr(p, '<');
+        if (!open) break;
+        const char *close = NULL;
+        for (size_t t = 0; t < sizeof(transient_block_tags) /
+                               sizeof(transient_block_tags[0]); t++)
+        {
+            const char *tag = transient_block_tags[t];
+            const size_t tag_len = strlen(tag);
+            if (strncmp(open + 1, tag, tag_len) || open[1 + tag_len] != '>')
+                continue;
+            char end_tag[64];
+            snprintf(end_tag, sizeof(end_tag), "</%s>", tag);
+            const char *end = strstr(open + tag_len + 2, end_tag);
+            if (end) close = end + strlen(end_tag);
+            break;
+        }
+        if (!close) {
+            buf_append(&out, p, (size_t)(open - p) + 1);
+            p = open + 1;
+            continue;
+        }
+        size_t keep = (size_t)(open - p);
+        while (keep > 0 && isspace((unsigned char)p[keep - 1])) keep--;
+        buf_append(&out, p, keep);
+        stripped = true;
+        p = close;
+    }
+    if (!stripped) {
+        buf_free(&out);
+        return NULL;
+    }
+    buf_puts(&out, p);
+    return buf_take(&out);
+}
+
 /* In thinking mode without tools, old assistant reasoning is intentionally not
  * rendered back into later prompts.  The sampled live graph still contains the
  * reasoning bytes, so the next request would miss the session cache even though
@@ -10606,6 +10745,11 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
+    char *stripped = strip_transient_blocks(visible);
+    if (stripped) {
+        free(visible);
+        visible = stripped;
+    }
     thinking_live_remember(s, slot, visible);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
@@ -10613,6 +10757,47 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(slot->session), strlen(visible));
+    free(visible);
+}
+
+static bool should_remember_transient_checkpoint(const request *r,
+                                                 const thinking_state *thinking,
+                                                 const char *finish) {
+    if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
+    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (thinking && thinking->inside) return false;
+    return true;
+}
+
+static void remember_transient_checkpoint(server *s, server_slot *slot,
+                                          const job *j, const char *ctx,
+                                          uint64_t trace_id, const char *content,
+                                          const char *reasoning,
+                                          const tool_calls *calls) {
+    char *visible = NULL;
+    char *stripped = NULL;
+    if (j->req.prompt_text) {
+        char *suffix = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+        buf b = {0};
+        buf_puts(&b, j->req.prompt_text);
+        buf_puts(&b, suffix);
+        free(suffix);
+        visible = buf_take(&b);
+        stripped = strip_transient_blocks(visible);
+    }
+    if (!stripped) {
+        thinking_live_clear(s, slot);
+        free(visible);
+        return;
+    }
+    thinking_live_remember(s, slot, stripped);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: transient live checkpoint remembered ctx=%s live=%d visible=%zu stripped=%zu",
+               ctx, ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
+    trace_event(s, trace_id,
+                "transient live checkpoint remembered: live=%d visible=%zu stripped=%zu",
+                ds4_session_pos(slot->session), strlen(visible), strlen(stripped));
+    free(stripped);
     free(visible);
 }
 
@@ -11014,7 +11199,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                                     &anthropic_live_match_ids);
         if (cached > 0) {
             anthropic_live_continuation = true;
-            cache_source = "anthropic-tool-output";
+            cache_source = j->req.api == API_ANTHROPIC ? "anthropic-tool-output"
+                                                       : "chat-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -11135,7 +11321,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   "ds4-server: %s live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   j->req.api == API_ANTHROPIC ? "anthropic" : "chat",
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
@@ -11170,6 +11357,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                req_flags);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
+    ds4_session_set_cancel(slot->session, server_request_cancelled, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -11207,6 +11395,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
+            ds4_session_set_cancel(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
@@ -11232,6 +11421,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
+        ds4_session_set_cancel(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
         kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
@@ -11248,6 +11438,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
+    ds4_session_set_cancel(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -11370,7 +11561,7 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!server_request_cancelled(&progress) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -11626,6 +11817,16 @@ decode_again:
     }
     server_generation_leave(s);
 
+    if (progress.client_disconnected && strcmp(finish, "error") != 0) {
+        finish = "error";
+        snprintf(err, sizeof(err), "client disconnected");
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s%s%s generation interrupted: client disconnected",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   req_flags[0] ? " " : "",
+                   req_flags);
+    }
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
@@ -11721,7 +11922,8 @@ decode_again:
                             &last_decode_log_completion);
     }
 
-    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
+    if (!progress.client_disconnected && j->req.stream &&
+        !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
         free(tail);
@@ -11872,9 +12074,13 @@ decode_again:
             responses_live_clear(s, slot);
         }
     }
-    if (j->req.api == API_ANTHROPIC) {
+    if (j->req.api == API_ANTHROPIC ||
+        (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT))
+    {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
-            strcmp(final_finish, "length"))
+            strcmp(final_finish, "length") &&
+            (j->req.api == API_ANTHROPIC ||
+             !should_canonicalize_tool_checkpoint(s, &parsed_calls)))
         {
             anthropic_live_remember(s, slot, &parsed_calls);
         } else {
@@ -11895,18 +12101,26 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s, slot);
-    } else if (parsed_calls.len) {
-        thinking_live_clear(s, slot);
-    } else if (!parsed_calls.len &&
-               should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
+    }
+    if (!parsed_calls.len &&
+        should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
-    } else if (!parsed_calls.len) {
+    } else if (should_remember_transient_checkpoint(&j->req, &thinking,
+                                                    final_finish)) {
+        /* Canonicalization above may rewrite the live session, so bind the
+         * stripped key only after the final frontier is established. */
+        remember_transient_checkpoint(s, slot, j, ctx_span, trace_id,
+                                      parsed_content ? parsed_content : "",
+                                      parsed_reasoning,
+                                      parsed_calls.len ? &parsed_calls : NULL);
+    } else {
         thinking_live_clear(s, slot);
     }
 
-    if (j->req.stream) {
+    if (progress.client_disconnected) {
+        /* The peer is gone, so all response writes would be wasted. */
+    } else if (j->req.stream) {
         bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -15558,6 +15772,51 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request_free(&r);
 }
 
+static void test_chat_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("grep_files");
+    tc.arguments = xstrdup("{\"pattern\":\"port\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool_msg = {0};
+    tool_msg.role = xstrdup("tool");
+    tool_msg.content = xstrdup("3002");
+    chat_msg_add_tool_call_id(&tool_msg, "call_live");
+    chat_msgs_push(&msgs, tool_msg);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "3002</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.anthropic_live_suffix_text, "grep_files") == NULL);
+
+    request r2;
+    request_init(&r2, REQ_CHAT, 128);
+    r2.api = API_ANTHROPIC;
+    chat_prepare_live_continuation(&r2, &msgs);
+    TEST_ASSERT(r2.anthropic_live_call_ids.len == 0);
+    TEST_ASSERT(r2.anthropic_live_suffix_text == NULL);
+
+    request_free(&r2);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_anthropic_tool_result_id_validation(void) {
     server s = {0};
     server_slot slot;
@@ -16293,6 +16552,23 @@ static void test_client_socket_nonblocking_flag(void) {
     close(sv[1]);
 }
 
+static void test_client_disconnect_cancels_request(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    server_prefill_progress progress = {.fd = sv[0], .stream = true};
+    TEST_ASSERT(!server_request_cancelled(&progress));
+    TEST_ASSERT(send(sv[1], "x", 1, 0) == 1);
+    TEST_ASSERT(!server_request_cancelled(&progress));
+    close(sv[1]);
+    sv[1] = -1;
+    TEST_ASSERT(server_request_cancelled(&progress));
+    TEST_ASSERT(progress.client_disconnected);
+    TEST_ASSERT(progress.stream_failed);
+    close(sv[0]);
+}
+
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -16343,6 +16619,106 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
+}
+
+static void test_strip_transient_blocks(void) {
+    TEST_ASSERT(strip_transient_blocks("plain <b>text</b>") == NULL);
+    TEST_ASSERT(strip_transient_blocks("") == NULL);
+
+    char *s = strip_transient_blocks(
+        "question?<environment_details>cwd=/x</environment_details>");
+    TEST_ASSERT(s && !strcmp(s, "question?"));
+    free(s);
+
+    s = strip_transient_blocks(
+        "question?\n\n<system-reminder>plan mode</system-reminder>tail");
+    TEST_ASSERT(s && !strcmp(s, "question?tail"));
+    free(s);
+
+    s = strip_transient_blocks(
+        "a<environment_details>1</environment_details>"
+        "b<system-reminder>2</system-reminder>c");
+    TEST_ASSERT(s && !strcmp(s, "abc"));
+    free(s);
+
+    TEST_ASSERT(strip_transient_blocks("a<environment_details>open") == NULL);
+    TEST_ASSERT(strip_transient_blocks(
+        "<environment_details_x>y</environment_details_x>") == NULL);
+}
+
+static void test_transient_checkpoint_remember_gate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    thinking_state st = {.inside = false};
+
+    TEST_ASSERT(should_remember_transient_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_transient_checkpoint(&r, &st, "tool_calls"));
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "error"));
+    st.inside = true;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+    st.inside = false;
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+    r.api = API_OPENAI;
+    r.kind = REQ_COMPLETION;
+    TEST_ASSERT(!should_remember_transient_checkpoint(&r, &st, "stop"));
+    request_free(&r);
+}
+
+static void test_transient_checkpoint_visible_matches_future_prompt(void) {
+    chat_msgs msgs = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup(
+        "List the files<environment_details>cwd=/tmp</environment_details>");
+    chat_msgs_push(&msgs, u1);
+    char *prompt_text =
+        render_chat_prompt_text(&msgs, "TOOL_SCHEMA_MARKER", NULL, DS4_THINK_HIGH);
+
+    const char *reasoning = "I should answer briefly.";
+    const char *content = "Two files: a and b.";
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, NULL);
+    buf visible = {0};
+    buf_puts(&visible, prompt_text);
+    buf_puts(&visible, suffix);
+    char *stripped = strip_transient_blocks(visible.ptr);
+    TEST_ASSERT(stripped != NULL);
+    TEST_ASSERT(strstr(stripped, "<environment_details>") == NULL);
+
+    chat_msgs history = {0};
+    chat_msg h_u1 = {0};
+    h_u1.role = xstrdup("user");
+    h_u1.content = xstrdup("List the files");
+    chat_msgs_push(&history, h_u1);
+    chat_msg h_a = {0};
+    h_a.role = xstrdup("assistant");
+    h_a.reasoning = xstrdup(reasoning);
+    h_a.content = xstrdup(content);
+    chat_msgs_push(&history, h_a);
+    chat_msg h_u2 = {0};
+    h_u2.role = xstrdup("user");
+    h_u2.content = xstrdup(
+        "Delete them<environment_details>cwd=/tmp turn=2</environment_details>");
+    chat_msgs_push(&history, h_u2);
+    char *future_prompt =
+        render_chat_prompt_text(&history, "TOOL_SCHEMA_MARKER", NULL, DS4_THINK_HIGH);
+    const size_t stripped_len = strlen(stripped);
+    TEST_ASSERT(strlen(future_prompt) > stripped_len);
+    TEST_ASSERT(!memcmp(future_prompt, stripped, stripped_len));
+
+    free(future_prompt);
+    free(stripped);
+    buf_free(&visible);
+    free(suffix);
+    request_free(&r);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
 }
 
 static void test_tool_marker_state_ignores_orphan_end(void) {
@@ -17472,6 +17848,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_chat_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
@@ -17499,8 +17876,12 @@ static void ds4_server_unit_tests_run(void) {
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_client_disconnect_cancels_request();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
+    test_strip_transient_blocks();
+    test_transient_checkpoint_remember_gate();
+    test_transient_checkpoint_visible_matches_future_prompt();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
     test_kv_cache_store_len_uses_configured_boundary();
